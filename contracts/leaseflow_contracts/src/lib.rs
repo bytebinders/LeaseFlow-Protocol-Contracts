@@ -36,6 +36,8 @@ mod nft_contract {
 /// Seconds of lease time granted per unit of funds added (1 day per unit).
 pub const SECS_PER_UNIT: u64 = 86_400;
 
+pub mod proration;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lease {
@@ -90,6 +92,11 @@ pub struct LeaseContract;
 
 #[contractimpl]
 impl LeaseContract {
+    /// Calculates the prorated first month's rent based on the move-in timestamp.
+    pub fn calculate_first_month_rent(_env: Env, start_date: u64, rent_amount: i128) -> i128 {
+        proration::calculate_first_month_rent(start_date, rent_amount)
+    }
+
     /// Initializes a lease with collateral lock (security deposit)
     pub fn initialize_lease(
         env: Env,
