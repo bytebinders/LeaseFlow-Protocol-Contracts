@@ -60,6 +60,17 @@ pub enum DepositStatus {
     Disputed,
 }
 
+/// Usage rights for NFT renters during lease period
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageRights {
+    pub renter: Address,
+    pub nft_contract: Address,
+    pub token_id: u128,
+    pub lease_id: Symbol,
+    pub valid_until: u64,
+}
+
 /// Lease lifecycle status
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +205,8 @@ pub enum DataKey {
     HistoricalLease(u64),
     /// Protocol admin address.
     Admin,
+    /// Usage rights for NFT renters.
+    UsageRights(Address, u128),
 }
 
 // ---------------------------------------------------------------------------
@@ -216,11 +229,32 @@ pub enum LeaseError {
     RentOutstanding = 3,
     DepositNotSettled = 4,
     Unauthorised = 5,
+    NftTransferFailed = 6,
+    NftNotReturned = 7,
+    UsageRightsNotFound = 8,
+    UsageRightsExpired = 9,
 }
 
 // ---------------------------------------------------------------------------
 // Storage helpers
 // ---------------------------------------------------------------------------
+
+/// Fetch UsageRights from storage, or None.
+pub fn load_usage_rights(env: &Env, nft_contract: Address, token_id: u128) -> Option<UsageRights> {
+    env.storage().instance().get(&DataKey::UsageRights(nft_contract, token_id))
+}
+
+/// Save UsageRights to storage.
+pub fn save_usage_rights(env: &Env, nft_contract: Address, token_id: u128, usage_rights: &UsageRights) {
+    env.storage()
+        .instance()
+        .set(&DataKey::UsageRights(nft_contract, token_id), usage_rights);
+}
+
+/// Removes UsageRights from storage.
+pub fn delete_usage_rights(env: &Env, nft_contract: Address, token_id: u128) {
+    env.storage().instance().remove(&DataKey::UsageRights(nft_contract, token_id));
+}
 
 /// Fetch a LeaseInstance from instance storage, or None.
 pub fn load_lease(env: &Env, lease_id: u64) -> Option<LeaseInstance> {
@@ -352,7 +386,7 @@ impl LeaseContract {
     }
 
     /// Creates a lease **and** immediately transfers an NFT from landlord to
-    /// tenant.  Rate inputs follow the same `RateType` convention as
+    /// contract escrow. Rate inputs follow the same `RateType` convention as
     /// [`create_lease`].
     pub fn create_lease_with_nft(
         env: Env,
@@ -372,10 +406,11 @@ impl LeaseContract {
         landlord.require_auth();
 
         let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
+        // Transfer NFT to contract escrow instead of directly to tenant
         nft_client.transfer_from(
             &env.current_contract_address(),
             &landlord,
-            &tenant,
+            &env.current_contract_address(),
             &token_id,
         );
 
@@ -404,8 +439,54 @@ impl LeaseContract {
             expiry_time,
         };
 
+        // Grant usage rights to the tenant for the lease duration
+        let usage_rights = UsageRights {
+            renter: tenant.clone(),
+            nft_contract: nft_contract_addr,
+            token_id,
+            lease_id: lease_id.clone(),
+            valid_until: expiry_time,
+        };
+        save_usage_rights(&env, nft_contract_addr, token_id, &usage_rights);
+
         env.storage().instance().set(&lease_id, &lease);
         symbol_short!("created")
+    }
+
+    /// Ends a lease and returns the NFT from contract escrow to the landlord.
+    /// Only the landlord or tenant can call this function.
+    pub fn end_lease(env: Env, lease_id: Symbol, caller: Address) -> Symbol {
+        let lease = Self::get_lease(env.clone(), lease_id.clone());
+        
+        // Authorization: only landlord or tenant can end the lease
+        require!(
+            lease.landlord == caller || lease.tenant == caller,
+            "Unauthorized: Only landlord or tenant can end lease"
+        );
+        caller.require_auth();
+        
+        // Check if NFT is associated with this lease
+        if let (Some(nft_contract_addr), Some(token_id)) = (lease.nft_contract, lease.token_id) {
+            // Remove usage rights first
+            delete_usage_rights(&env, nft_contract_addr, token_id);
+            
+            // Transfer NFT back to landlord from escrow
+            let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                &token_id,
+            );
+        }
+        
+        // Update lease status to terminated
+        let mut updated_lease = lease;
+        updated_lease.status = LeaseStatus::Terminated;
+        updated_lease.active = false;
+        
+        env.storage().instance().set(&lease_id, &updated_lease);
+        symbol_short!("ended")
     }
 
     /// Activates a pending lease after the security deposit has been received.
@@ -490,6 +571,20 @@ impl LeaseContract {
                 symbol_short!("disputed")
             }
         }
+    }
+
+    /// Checks if a given address has usage rights for a specific NFT.
+    /// Returns the UsageRights if valid and not expired, None otherwise.
+    pub fn check_usage_rights(env: Env, nft_contract: Address, token_id: u128, user: Address) -> Option<UsageRights> {
+        if let Some(usage_rights) = load_usage_rights(&env, nft_contract, token_id) {
+            let current_time = env.ledger().timestamp();
+            
+            // Check if the user is the renter and the rights haven't expired
+            if usage_rights.renter == user && current_time <= usage_rights.valid_until {
+                return Some(usage_rights);
+            }
+        }
+        None
     }
 
     /// Returns the lease stored under `lease_id`.

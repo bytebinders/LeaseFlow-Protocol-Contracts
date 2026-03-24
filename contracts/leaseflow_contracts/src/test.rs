@@ -4,7 +4,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    Address, Env, Event, String,
+    Address, Env, Event, String, Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -237,6 +237,218 @@ fn test_terminate_lease_emits_terminated_event() {
         env.events().all(),
         std::vec![expected.to_xdr(&env, &id)],
     );
+}
+
+// ---------------------------------------------------------------------------
+// NFT Escrow Tests
+// ---------------------------------------------------------------------------
+
+/// Mock NFT contract for testing
+#[contractclient(name = "MockNftClient")]
+pub trait MockNftInterface {
+    fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
+    fn owner_of(env: Env, token_id: u128) -> Address;
+}
+
+/// Test that create_lease_with_nft transfers NFT to contract escrow
+#[test]
+fn test_create_lease_with_nft_escrows_to_contract() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 123;
+    
+    // Register mock NFT contract
+    let nft_client = MockNftClient::new(&env, &nft_contract);
+    
+    // Create lease with NFT
+    let lease_id = symbol_short!("test_lease");
+    let result = client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64, // 1 day duration
+        &2000u64,  // grace period
+        &100i128,  // late fee flat
+        &50i128,   // late fee amount
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    assert_eq!(result, symbol_short!("created"));
+    
+    // Verify usage rights were granted to tenant
+    let usage_rights = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights.is_some());
+    
+    let rights = usage_rights.unwrap();
+    assert_eq!(rights.renter, tenant);
+    assert_eq!(rights.nft_contract, nft_contract);
+    assert_eq!(rights.token_id, token_id);
+    assert_eq!(rights.lease_id, lease_id);
+}
+
+/// Test that end_lease transfers NFT back to landlord and removes usage rights
+#[test]
+fn test_end_lease_returns_nft_to_landlord() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 456;
+    
+    // Create lease with NFT first
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64,
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // Verify usage rights exist
+    let usage_rights_before = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_before.is_some());
+    
+    // End lease as landlord
+    let result = client.end_lease(&lease_id, &landlord);
+    assert_eq!(result, symbol_short!("ended"));
+    
+    // Verify usage rights were removed
+    let usage_rights_after = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_after.is_none());
+    
+    // Verify lease status is terminated
+    let lease = client.get_lease(&lease_id);
+    assert_eq!(lease.status, LeaseStatus::Terminated);
+    assert!(!lease.active);
+}
+
+/// Test that unauthorized parties cannot end lease
+#[test]
+fn test_end_lease_unauthorized_fails() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 789;
+    
+    // Create lease with NFT
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64,
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // Try to end lease as unauthorized party
+    let result = client.try_end_lease(&lease_id, &stranger);
+    assert!(result.is_err());
+}
+
+/// Test usage rights expiration
+#[test]
+fn test_usage_rights_expiration() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 999;
+    
+    // Create lease with NFT with short duration
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &100u64, // Very short duration
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // Verify usage rights exist initially
+    let usage_rights_before = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_before.is_some());
+    
+    // Advance time beyond lease duration
+    env.ledger().with_mut(|l| l.timestamp += 200u64);
+    
+    // Verify usage rights have expired
+    let usage_rights_after = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights_after.is_none());
+}
+
+/// Test that tenant can also end lease
+#[test]
+fn test_end_lease_tenant_can_end() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let nft_contract = Address::generate(&env);
+    let token_id: u128 = 111;
+    
+    // Create lease with NFT
+    let lease_id = symbol_short!("test_lease");
+    client.create_lease_with_nft(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &1000i128,
+        &RateType::PerDay,
+        &86400u64,
+        &2000u64,
+        &100i128,
+        &50i128,
+        &RateType::PerDay,
+        &nft_contract,
+        &token_id,
+    );
+    
+    // End lease as tenant
+    let result = client.end_lease(&lease_id, &tenant);
+    assert_eq!(result, symbol_short!("ended"));
+    
+    // Verify usage rights were removed
+    let usage_rights = client.check_usage_rights(&nft_contract, &token_id, &tenant);
+    assert!(usage_rights.is_none());
 }
 
 /// Tenant can also invoke termination (not just landlord).
