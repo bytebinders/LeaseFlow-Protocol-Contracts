@@ -80,6 +80,11 @@ mod nft_contract {
     }
 }
 
+/// Seconds of lease time granted per unit of funds added (1 day per unit).
+pub const SECS_PER_UNIT: u64 = 86_400;
+
+pub mod proration;
+
 /// Core lease record stored on-chain.
 ///
 /// All rate fields (`rent_per_sec`, `late_fee_per_sec`) are normalised to
@@ -261,6 +266,46 @@ pub struct LeaseContract;
 
 #[contractimpl]
 impl LeaseContract {
+    /// Calculates the prorated first month's rent based on the move-in timestamp.
+    pub fn calculate_first_month_rent(_env: Env, start_date: u64, rent_amount: i128) -> i128 {
+        proration::calculate_first_month_rent(start_date, rent_amount)
+    }
+
+    /// Initializes a lease with collateral lock (security deposit)
+    pub fn initialize_lease(
+        env: Env,
+        landlord: Address,
+        tenant: Address,
+        rent_amount: i128,
+        deposit_amount: i128,
+        start_date: u64,
+        end_date: u64,
+        property_uri: String,
+    ) -> Symbol {
+        let lease = Lease {
+            landlord: landlord.clone(),
+            tenant: tenant.clone(),
+            rent_amount,
+            deposit_amount,
+            start_date,
+            end_date,
+            property_uri: property_uri.clone(),
+            status: LeaseStatus::Pending,
+    /// Initializes a simple lease between a landlord and a tenant.
+    pub fn create_lease(
+        env: Env,
+        landlord: Address,
+        tenant: Address,
+        amount: i128,
+        grace_period_end: u64,
+        late_fee_flat: i128,
+        late_fee_per_day: i128,
+    ) -> Symbol {
+    /// Original function — unchanged behaviour, no NFT required.
+    pub fn create_lease(env: Env, landlord: Address, tenant: Address, amount: i128) -> Symbol {
+    /// Initializes a lease between a landlord and a tenant.
+    /// `lease_id` uniquely identifies the lease in storage.
+    /// `duration` sets the initial lease duration in seconds.
     
     pub fn create_lease(
         env: Env,
