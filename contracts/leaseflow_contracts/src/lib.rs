@@ -1,6 +1,9 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
+// Re-export the pure math function so contract callers and tests can use it.
+pub use leaseflow_math::calculate_total_cost;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lease {
