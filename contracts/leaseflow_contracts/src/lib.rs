@@ -103,6 +103,8 @@ pub struct LeaseInstance {
     pub rent_amount: i128,
     /// Security deposit amount in stroops.
     pub deposit_amount: i128,
+    /// Additional security deposit for damage protection in stroops.
+    pub security_deposit: i128,
     /// Unix timestamp: lease start.
     pub start_date: u64,
     /// Unix timestamp: lease end — termination is only allowed after this.
@@ -156,6 +158,7 @@ pub struct CreateLeaseParams {
     pub tenant: Address,
     pub rent_amount: i128,
     pub deposit_amount: i128,
+    pub security_deposit: i128,
     pub start_date: u64,
     pub end_date: u64,
     pub property_uri: String,
@@ -216,6 +219,7 @@ pub enum LeaseError {
     RentOutstanding = 3,
     DepositNotSettled = 4,
     Unauthorised = 5,
+    InvalidDeduction = 6,
 }
 
 // ---------------------------------------------------------------------------
@@ -584,12 +588,25 @@ impl LeaseContract {
             tenant: params.tenant,
             rent_amount: params.rent_amount,
             deposit_amount: params.deposit_amount,
+            security_deposit: params.security_deposit,
             start_date: params.start_date,
             end_date: params.end_date,
             rent_paid_through: 0,
             deposit_status: DepositStatus::Held,
             status: LeaseStatus::Pending,
             property_uri: params.property_uri,
+            rent_per_sec: 0,
+            grace_period_end: params.end_date,
+            late_fee_flat: 0,
+            late_fee_per_sec: 0,
+            debt: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            rent_paid: 0,
+            expiry_time: params.end_date,
+            nft_contract: None,
+            token_id: None,
+            active: true,
         };
         save_lease(&env, lease_id, &lease);
         Ok(())
@@ -700,6 +717,66 @@ impl LeaseContract {
         LeaseTerminated { lease_id }.publish(&env);
 
         Ok(())
+    }
+
+    /// Concludes a lease and processes security deposit refund with damage deductions.
+    /// Only the landlord can call this function to approve the return and specify damage deductions.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease to conclude
+    /// * `damage_deduction` - Amount to deduct from security deposit for damages
+    /// 
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
+    /// * `LeaseError::Unauthorised` - Caller is not the landlord
+    /// * `LeaseError::LeaseNotExpired` - Lease has not yet expired
+    /// * `LeaseError::RentOutstanding` - Rent has not been paid through end_date
+    /// 
+    /// # Returns
+    /// Returns the refund amount (security_deposit - damage_deduction) to be returned to tenant
+    pub fn conclude_lease(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        damage_deduction: i128,
+    ) -> Result<i128, LeaseError> {
+        // 1. Load lease
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // 2. Authorisation - only landlord can conclude lease
+        if landlord != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        landlord.require_auth();
+        
+        // 3. Validate lease state
+        let now = env.ledger().timestamp();
+        if now <= lease.end_date {
+            return Err(LeaseError::LeaseNotExpired);
+        }
+        
+        if lease.rent_paid_through < lease.end_date {
+            return Err(LeaseError::RentOutstanding);
+        }
+        
+        // 4. Validate damage deduction
+        if damage_deduction < 0 || damage_deduction > lease.security_deposit {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
+        // 5. Calculate refund amount
+        let refund_amount = lease.security_deposit - damage_deduction;
+        
+        // 6. Update lease status
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        
+        // 7. Save updated lease
+        save_lease(&env, lease_id, &lease);
+        
+        // 8. Return refund amount
+        Ok(refund_amount)
     }
 }
 
