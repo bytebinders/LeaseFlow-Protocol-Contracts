@@ -12,7 +12,7 @@ pub fn calculate_total_cost(duration_secs: u64, rate_per_sec: u64) -> Option<u64
 /// share and giving the remainder to the tenant.
 pub fn calculate_deposit_split(total_deposit: i128, landlord_bps: u32) -> Option<(i128, i128)> {
     let landlord_pct = (landlord_bps.min(10000)) as i128;
-    
+
     // Intermediate calculation to prevent overflow before division
     let landlord_share = total_deposit.checked_mul(landlord_pct)? / 10000;
     let tenant_share = total_deposit.checked_sub(landlord_share)?;
@@ -37,7 +37,7 @@ mod tests {
             let result = calculate_deposit_split(total, bps);
             assert!(result.is_some());
             let (landlord, tenant) = result.unwrap();
-            
+
             // Prove Conservation: The sum MUST exactly match the input
             prop_assert_eq!(
                 landlord + tenant,
@@ -68,7 +68,7 @@ mod tests {
             // This test verifies that we correctly return None on overflow
             // instead of producing "ghost tokens" or wrapping around.
             let result = calculate_deposit_split(total, bps);
-            
+
             // If total is close to MAX and bps > 0, total*bps should overflow
             if bps > 0 {
                 prop_assert!(result.is_none());
@@ -76,6 +76,3 @@ mod tests {
         }
     }
 }
-
-
-

@@ -1,8 +1,8 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use libfuzzer_sys::fuzz_target;
 use leaseflow_math::calculate_deposit_split;
+use libfuzzer_sys::fuzz_target;
 
 /// Fuzz input for deposit splitting.
 #[derive(Arbitrary, Debug)]
@@ -29,7 +29,10 @@ fuzz_target!(|input: SplitInput| {
             // Check if it was really an overflow.
             let landlord_pct = (landlord_bps.min(10000)) as i128;
             if total_deposit.checked_mul(landlord_pct).is_some() {
-                panic!("calculate_deposit_split returned None unexpectedly for total={}, bps={}", total_deposit, landlord_bps);
+                panic!(
+                    "calculate_deposit_split returned None unexpectedly for total={}, bps={}",
+                    total_deposit, landlord_bps
+                );
             }
         }
         Some((landlord_share, tenant_share)) => {
@@ -45,7 +48,11 @@ fuzz_target!(|input: SplitInput| {
             );
 
             // --- Property 3: Shares must be non-negative for non-negative total ---
-            assert!(landlord_share >= 0, "Negative landlord share: {}", landlord_share);
+            assert!(
+                landlord_share >= 0,
+                "Negative landlord share: {}",
+                landlord_share
+            );
             assert!(tenant_share >= 0, "Negative tenant share: {}", tenant_share);
 
             // --- Property 4: Determinism ---
@@ -56,7 +63,14 @@ fuzz_target!(|input: SplitInput| {
             // If we increase bps, landlord share should not decrease.
             if landlord_bps < 10000 {
                 if let Some((l2, _)) = calculate_deposit_split(total_deposit, landlord_bps + 1) {
-                    assert!(l2 >= landlord_share, "BPS monotonicity violation: bps={} gave landlord {}, bps={} gave {}", landlord_bps, landlord_share, landlord_bps+1, l2);
+                    assert!(
+                        l2 >= landlord_share,
+                        "BPS monotonicity violation: bps={} gave landlord {}, bps={} gave {}",
+                        landlord_bps,
+                        landlord_share,
+                        landlord_bps + 1,
+                        l2
+                    );
                 }
             }
         }
