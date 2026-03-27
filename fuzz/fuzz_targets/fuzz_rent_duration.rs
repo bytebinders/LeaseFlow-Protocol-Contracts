@@ -1,8 +1,8 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use libfuzzer_sys::fuzz_target;
 use leaseflow_math::calculate_total_cost;
+use libfuzzer_sys::fuzz_target;
 
 /// Structured fuzz input covering both duration and rate dimensions.
 #[derive(Arbitrary, Debug)]
