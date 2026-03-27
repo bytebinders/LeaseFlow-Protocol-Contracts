@@ -199,6 +199,19 @@ pub struct CreateLeaseParams {
 }
 
 
+// #[contracttype]
+// #[derive(Clone, Debug, Eq, PartialEq)]
+// pub enum DataKey {
+//     Lease(Symbol),
+//     LeaseInstance(u64),
+//     Receipt(Symbol, u32),
+//     Admin,
+//     UsageRights(Address, u128),
+//     HistoricalLease(u64),
+//     KycProvider,
+//     AllowedAsset(Address),
+// }
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -210,6 +223,21 @@ pub enum DataKey {
     HistoricalLease(u64),
     KycProvider,
     AllowedAsset(Address),
+    AuthorizedPayer(u64, Address), 
+    RoommateBalance(u64, Address),
+}
+
+#[contractevent]
+pub struct RoommateAdded {
+    pub lease_id: u64,
+    pub roommate: Address,
+}
+
+#[contractevent]
+pub struct RentPaidPartial {
+    pub lease_id: u64,
+    pub roommate: Address,
+    pub amount: i128,
 }
 
 
@@ -706,32 +734,50 @@ impl LeaseContract {
         Ok(())
     }
 
-    pub fn pay_lease_instance_rent(env: Env, lease_id: u64, payment_amount: i128) -> Result<(), LeaseError> {
+  pub fn pay_lease_instance_rent(env: Env, lease_id: u64, payer: Address, payment_amount: i128) -> Result<(), LeaseError> {
+        payer.require_auth();
+
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         require!(lease.active, "Lease is not active");
-        Self::require_kyc(&env, &lease.landlord, &lease.tenant)?;
-        Self::require_stablecoin(&env, &lease.payment_token)?;
 
-        // Allow rent payments even when paused (tenant can still pay to stay current)
-        if lease.maintenance_status == MaintenanceStatus::Reported || lease.maintenance_status == MaintenanceStatus::Fixed {
-            lease.withheld_rent += payment_amount;
-        } else {
-            lease.cumulative_payments += payment_amount;
-            lease.rent_paid += payment_amount;
+        let is_primary = payer == lease.tenant;
+        let is_authorized = env.storage().persistent().get::<_, bool>(&DataKey::AuthorizedPayer(lease_id, payer.clone())).unwrap_or(false);
+        if !is_primary && !is_authorized {
+            return Err(LeaseError::Unauthorised);
         }
-        
+
+        let balance_key = DataKey::RoommateBalance(lease_id, payer.clone());
+        let mut payer_bal: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        payer_bal += payment_amount;
+        env.storage().persistent().set(&balance_key, &payer_bal);
+        env.storage().persistent().extend_ttl(&balance_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
+        lease.cumulative_payments += payment_amount;
+        lease.rent_paid += payment_amount;
+
+        let token_client = soroban_sdk::token::Client::new(&env, &lease.payment_token);
+        token_client.transfer(
+            &payer, 
+            &env.current_contract_address(), 
+            &payment_amount
+        );
+
+        RentPaidPartial { lease_id, roommate: payer.clone(), amount: payment_amount }.publish(&env);
+
         if let Some(buyout_price) = lease.buyout_price {
-            if lease.cumulative_payments >= buyout_price && (lease.maintenance_status == MaintenanceStatus::None || lease.maintenance_status == MaintenanceStatus::Verified) {
+            if lease.cumulative_payments >= buyout_price {
                 lease.active = false;
                 lease.status = LeaseStatus::Terminated;
                 if let (Some(nft), Some(id)) = (&lease.nft_contract, &lease.token_id) {
                     let client = nft_contract::NftClient::new(&env, nft);
+                    // Transfers NFT to the primary tenant upon buyout completion
                     client.transfer_from(&env.current_contract_address(), &env.current_contract_address(), &lease.tenant, id);
                 }
                 archive_lease(&env, lease_id, lease.clone(), env.current_contract_address());
                 return Ok(());
             }
         }
+        
         save_lease_instance(&env, lease_id, &lease);
         Ok(())
     }
@@ -1254,378 +1300,30 @@ impl LeaseContract {
         Ok(total_debt)
     }
 
-    /// Pauses rent accrual for a lease due to emergency situations like natural disasters.
-    /// Can be called by admin, landlord, or whitelisted arbitrators.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease to pause
-    /// * `caller` - Address initiating the pause (admin, landlord, or arbitrator)
-    /// * `reason` - Reason for the emergency pause (e.g., "Flood damage", "Earthquake")
-    /// 
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
-    /// * `LeaseError::Unauthorised` - Caller is not authorized to pause rent
-    /// * `LeaseError::LeaseAlreadyPaused` - Lease is already in paused state
-    /// * `LeaseError::InvalidPauseReason` - Pause reason is empty or invalid
-    pub fn emergency_pause_rent(
-        env: Env,
-        lease_id: u64,
-        caller: Address,
-        reason: String,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        // Authorization check: admin, landlord, or whitelisted arbitrator
-        let is_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|admin| admin == caller)
-            .unwrap_or(false);
-        let is_landlord = caller == lease.landlord;
-        let is_arbitrator = lease.arbitrators.contains(&caller);
-        
-        if !is_admin && !is_landlord && !is_arbitrator {
-            return Err(LeaseError::Unauthorised);
-        }
-        caller.require_auth();
-        
-        // Check if lease is already paused
-        if lease.paused {
-            return Err(LeaseError::LeaseAlreadyPaused);
-        }
-        
-        // Validate pause reason
-        if reason.len() == 0 {
-            return Err(LeaseError::InvalidPauseReason);
-        }
-        
-        let current_time = env.ledger().timestamp();
-        
-        // Update lease state to paused
-        lease.paused = true;
-        lease.pause_reason = Some(reason.clone());
-        lease.paused_at = Some(current_time);
-        lease.pause_initiator = Some(caller.clone());
-        lease.status = LeaseStatus::Paused;
-        
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Emit pause event
-        EmergencyRentPaused {
-            lease_id,
-            initiator: caller,
-            reason,
-            paused_at: current_time,
-        }.publish(&env);
-        
-        Ok(())
-    }
-
-    /// Resumes rent accrual for a previously paused lease.
-    /// Can be called by admin, landlord, or the original pause initiator.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease to resume
-    /// * `caller` - Address initiating the resume
-    /// 
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
-    /// * `LeaseError::Unauthorised` - Caller is not authorized to resume rent
-    /// * `LeaseError::LeaseNotPaused` - Lease is not currently paused
-    pub fn emergency_resume_rent(
-        env: Env,
-        lease_id: u64,
-        caller: Address,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        // Authorization check: admin, landlord, or original pause initiator
-        let is_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|admin| admin == caller)
-            .unwrap_or(false);
-        let is_landlord = caller == lease.landlord;
-        let is_original_initiator = lease.pause_initiator
-            .as_ref()
-            .map(|initiator| initiator == &caller)
-            .unwrap_or(false);
-        
-        if !is_admin && !is_landlord && !is_original_initiator {
-            return Err(LeaseError::Unauthorised);
-        }
-        caller.require_auth();
-        
-        // Check if lease is actually paused
-        if !lease.paused {
-            return Err(LeaseError::LeaseNotPaused);
-        }
-        
-        let current_time = env.ledger().timestamp();
-        
-        // Calculate total paused duration
-        if let Some(paused_at) = lease.paused_at {
-            let pause_duration = current_time.saturating_sub(paused_at);
-            lease.total_paused_duration = lease.total_paused_duration.saturating_add(pause_duration);
-        }
-        
-        // Update lease state to active
-        lease.paused = false;
-        lease.status = LeaseStatus::Active;
-        // Keep pause history for audit trail
-        
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Emit resume event
-        EmergencyRentResumed {
-            lease_id,
-            initiator: caller,
-            resumed_at: current_time,
-            total_paused_duration: lease.total_paused_duration,
-        }.publish(&env);
-        
-        Ok(())
-    }
-
-    /// Gets the current pause status and details for a lease.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease
-    /// 
-    /// # Returns
-    /// Returns a tuple containing:
-    /// * `paused: bool` - Whether the lease is currently paused
-    /// * `pause_reason: Option<String>` - Reason for pause if paused
-    /// * `paused_at: Option<u64>` - Timestamp when paused
-    /// * `total_paused_duration: u64` - Total time spent paused
-    pub fn get_pause_status(
-        env: Env,
-        lease_id: u64,
-    ) -> Result<(bool, Option<String>, Option<u64>, u64), LeaseError> {
+    /// Authorizes an additional roommate to make payments towards a lease.
+    pub fn add_authorized_payer(env: Env, lease_id: u64, landlord: Address, roommate: Address) -> Result<(), LeaseError> {
         let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         
-        Ok((
-            lease.paused,
-            lease.pause_reason,
-            lease.paused_at,
-            lease.total_paused_duration,
-        ))
-    }
-
-    /// Authorizes the contract to automatically pull rent from tenant's account.
-    /// This enables "Auto-Pay" functionality where rent is automatically withdrawn
-    /// every billing cycle without manual intervention.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease
-    /// * `tenant` - Tenant address authorizing the auto-pull
-    /// * `authorized_amount` - Amount approved for automatic withdrawal per billing cycle
-    /// * `billing_cycle_duration` - Optional custom billing cycle in seconds (defaults to 30 days)
-    /// 
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
-    /// * `LeaseError::Unauthorised` - Caller is not the tenant
-    /// 
-    /// # Security
-    /// Only the tenant can authorize rent pulls for their own lease.
-    /// The authorization can be revoked at any time by the tenant.
-    pub fn authorize_rent_pull(
-        env: Env,
-        lease_id: u64,
-        tenant: Address,
-        authorized_amount: i128,
-        billing_cycle_duration: Option<u64>,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        // Only tenant can authorize rent pulls
-        if lease.tenant != tenant {
-            return Err(LeaseError::Unauthorised);
-        }
-        tenant.require_auth();
-        
-        // Set authorization details
-        lease.rent_pull_authorized_amount = Some(authorized_amount);
-        lease.last_rent_pull_timestamp = None; // Reset timestamp when re-authorizing
-        
-        // Use custom billing cycle or keep existing one
-        if let Some(cycle_duration) = billing_cycle_duration {
-            lease.billing_cycle_duration = cycle_duration;
-        }
-        
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Emit authorization event
-        RentPullAuthorized {
-            lease_id,
-            tenant,
-            authorized_amount,
-            billing_cycle_duration: lease.billing_cycle_duration,
-        }.publish(&env);
-        
-        Ok(())
-    }
-
-    /// Executes an automatic rent pull if conditions are met.
-    /// Can only be called once per billing cycle and only by the landlord.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease
-    /// * `landlord` - Landlord address executing the pull
-    /// * `token_contract_id` - The payment token contract address
-    /// 
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
-    /// * `LeaseError::Unauthorised` - Caller is not the landlord
-    /// * `LeaseError::RentPullNotAuthorized` - Tenant has not authorized rent pulls
-    /// * `LeaseError::BillingCycleNotElapsed` - Not enough time has passed since last pull
-    /// * `LeaseError::InsufficientAuthorizedAmount` - Authorized amount is less than required rent
-    /// 
-    /// # Returns
-    /// Returns the amount that was successfully pulled
-    pub fn execute_rent_pull(
-        env: Env,
-        lease_id: u64,
-        landlord: Address,
-        token_contract_id: Address,
-    ) -> Result<i128, LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        // Only landlord can execute rent pulls
-        if lease.landlord != landlord {
-            return Err(LeaseError::Unauthorised);
+        // Only the landlord can authorize new payers to the lease
+        if lease.landlord != landlord { 
+            return Err(LeaseError::Unauthorised); 
         }
         landlord.require_auth();
-        
-        // Check if rent pull is authorized
-        let authorized_amount = lease.rent_pull_authorized_amount
-            .ok_or(LeaseError::RentPullNotAuthorized)?;
-        
-        let current_time = env.ledger().timestamp();
-        
-        // Check if billing cycle has elapsed since last pull
-        if let Some(last_pull) = lease.last_rent_pull_timestamp {
-            let time_since_last_pull = current_time.saturating_sub(last_pull);
-            if time_since_last_pull < lease.billing_cycle_duration {
-                return Err(LeaseError::BillingCycleNotElapsed);
-            }
-        }
-        
-        // Calculate expected rent for this billing cycle
-        let billing_cycle_rent = (lease.billing_cycle_duration as i128)
-            .saturating_mul(lease.rent_per_sec);
-        
-        // Ensure authorized amount covers the required rent
-        if authorized_amount < billing_cycle_rent {
-            return Err(LeaseError::InsufficientAuthorizedAmount);
-        }
-        
-        // Use the smaller of authorized amount or required rent
-        let pull_amount = authorized_amount.min(billing_cycle_rent);
-        
-        // Execute the token transfer from tenant to contract
-        let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
-        token_client.transfer(
-            &lease.tenant,
-            &env.current_contract_address(),
-            &pull_amount,
-        );
-        
-        // Update lease state
-        lease.rent_paid += pull_amount;
-        lease.cumulative_payments += pull_amount;
-        lease.last_rent_pull_timestamp = Some(current_time);
-        
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Emit pull execution event
-        RentPullExecuted {
-            lease_id,
-            landlord,
-            amount_pulled: pull_amount,
-            timestamp: current_time,
-        }.publish(&env);
-        
-        Ok(pull_amount)
-    }
 
-    /// Revokes the automatic rent pull authorization.
-    /// After revocation, the landlord can no longer automatically pull rent.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease
-    /// * `tenant` - Tenant address revoking the authorization
-    /// 
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
-    /// * `LeaseError::Unauthorised` - Caller is not the tenant
-    /// 
-    /// # Security
-    /// Only the tenant can revoke their own rent pull authorization.
-    pub fn revoke_rent_pull_authorization(
-        env: Env,
-        lease_id: u64,
-        tenant: Address,
-    ) -> Result<(), LeaseError> {
-        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        // Only tenant can revoke authorization
-        if lease.tenant != tenant {
-            return Err(LeaseError::Unauthorised);
-        }
-        tenant.require_auth();
-        
-        // Clear authorization
-        lease.rent_pull_authorized_amount = None;
-        lease.last_rent_pull_timestamp = None;
-        
-        save_lease_instance(&env, lease_id, &lease);
-        
-        // Emit revocation event
-        RentPullRevoked {
-            lease_id,
-            tenant,
-            timestamp: env.ledger().timestamp(),
-        }.publish(&env);
-        
+        // Save the roommate to persistent storage
+        let key = DataKey::AuthorizedPayer(lease_id, roommate.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
+        RoommateAdded { lease_id, roommate }.publish(&env);
         Ok(())
     }
 
-    /// Gets the current auto-pay authorization status for a lease.
-    /// 
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease
-    /// 
-    /// # Returns
-    /// Returns a tuple containing:
-    /// * `authorized_amount: Option<i128>` - Amount authorized for auto-pull (None if not authorized)
-    /// * `last_pull_timestamp: Option<u64>` - Timestamp of last successful pull
-    /// * `billing_cycle_duration: u64` - Duration of billing cycle in seconds
-    /// * `next_pull_available: Option<u64>` - Timestamp when next pull becomes available
-    pub fn get_rent_pull_status(
-        env: Env,
-        lease_id: u64,
-    ) -> Result<(Option<i128>, Option<u64>, u64, Option<u64>), LeaseError> {
-        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        
-        let next_pull_available = lease.last_rent_pull_timestamp
-            .map(|last_pull| last_pull.saturating_add(lease.billing_cycle_duration));
-        
-        Ok((
-            lease.rent_pull_authorized_amount,
-            lease.last_rent_pull_timestamp,
-            lease.billing_cycle_duration,
-            next_pull_available,
-        ))
+    pub fn get_roommate_balance(env: Env, lease_id: u64, roommate: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoommateBalance(lease_id, roommate))
+            .unwrap_or(0)
     }
 }
 
