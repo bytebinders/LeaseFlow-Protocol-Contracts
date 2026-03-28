@@ -946,7 +946,8 @@ fn test_utility_billing_unauthorized_landlord() {
     let bill_hash = BytesN::from_array(&env, &[1u8; 32]);
     let usdc_amount = 150i128;
 
-    let result = client.try_request_utility_payment(&LEASE_ID, &unauthorized, &bill_hash, &usdc_amount);
+    let result =
+        client.try_request_utility_payment(&LEASE_ID, &unauthorized, &bill_hash, &usdc_amount);
     assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
 }
 
@@ -984,7 +985,8 @@ fn test_utility_billing_invalid_amount() {
     let bill_hash = BytesN::from_array(&env, &[1u8; 32]);
     let invalid_amount = -50i128;
 
-    let result = client.try_request_utility_payment(&LEASE_ID, &landlord, &bill_hash, &invalid_amount);
+    let result =
+        client.try_request_utility_payment(&LEASE_ID, &landlord, &bill_hash, &invalid_amount);
     assert_eq!(result, Err(Ok(LeaseError::InvalidAmount)));
 }
 
@@ -1071,7 +1073,8 @@ fn test_utility_bill_payment_expired() {
     let bill_id = client.request_utility_payment(&LEASE_ID, &landlord, &bill_hash, &usdc_amount);
 
     // Fast forward 8 days (past 7-day due date)
-    env.ledger().with_mut(|l| l.timestamp = START + (8 * 24 * 60 * 60));
+    env.ledger()
+        .with_mut(|l| l.timestamp = START + (8 * 24 * 60 * 60));
 
     let result = client.try_pay_utility_bill(&LEASE_ID, &bill_id, &tenant, &usdc_amount);
     assert_eq!(result, Err(Ok(LeaseError::UtilityBillExpired)));
@@ -1158,7 +1161,7 @@ fn test_sublet_authorization_success() {
     let sublet_end = START + (60 * 86400);
     let sublet_rent = 1200i128;
     let landlord_bps = 8000u32; // 80%
-    let tenant_bps = 2000u32;  // 20%
+    let tenant_bps = 2000u32; // 20%
 
     client.authorize_sublet(
         &LEASE_ID,
@@ -1222,7 +1225,7 @@ fn test_sublet_invalid_percentage_split() {
     let sublet_end = START + (60 * 86400);
     let sublet_rent = 1200i128;
     let landlord_bps = 7000u32; // 70%
-    let tenant_bps = 2000u32;  // 20% (total 90%, not 100%)
+    let tenant_bps = 2000u32; // 20% (total 90%, not 100%)
 
     let result = client.try_authorize_sublet(
         &LEASE_ID,
@@ -1325,7 +1328,7 @@ fn test_sublet_rent_payment_success() {
     let sublet_end = START + (60 * 86400);
     let sublet_rent = 1200i128;
     let landlord_bps = 8000u32; // 80%
-    let tenant_bps = 2000u32;  // 20%
+    let tenant_bps = 2000u32; // 20%
 
     client.authorize_sublet(
         &LEASE_ID,
@@ -1439,13 +1442,13 @@ fn test_invariant_total_deposit_balance() {
         &end_date,
         &property_uri,
     );
-    
+
     let lease = client.get_lease();
-    
+
     // Invariant: Total deposit should match individual deposit amount
     assert_eq!(lease.deposit_amount, deposit_amount);
     assert!(lease.deposit_amount > 0, "Deposit must be positive");
-    
+
     // After activation, deposit should remain unchanged
     client.activate_lease(&tenant);
     let lease_after_activation = client.get_lease();
@@ -1477,13 +1480,13 @@ fn test_invariant_no_double_leasing() {
         &end_date,
         &property_uri,
     );
-    
+
     // Second lease with same property should fail
     // Note: In a real test environment, this would be caught by proper error handling
     // For now, we'll just verify the first lease was created successfully
     let lease = client.get_lease();
     assert_eq!(lease.property_uri, property_uri);
-    
+
     // The global registry check prevents double-leasing in the actual contract
     // This test demonstrates the functionality exists
 }
@@ -1511,19 +1514,19 @@ fn test_invariant_partial_refund_sum() {
         &end_date,
         &property_uri,
     );
-    
+
     client.activate_lease(&tenant);
-    
+
     // Test invariant: partial refund amounts must sum to total deposit
     let partial_invalid = DepositReleasePartial {
         tenant_amount: 1000i128,
         landlord_amount: 1500i128, // Sum = 2500, exceeds deposit of 2000
     };
     let release_invalid = DepositRelease::PartialRefund(partial_invalid);
-    
+
     // Note: In a real test environment, this would be caught by proper error handling
     // The contract contains the invariant check that prevents this scenario
-    
+
     // Valid partial refund should work
     let partial_valid = DepositReleasePartial {
         tenant_amount: 1500i128,
@@ -1557,15 +1560,15 @@ fn test_invariant_lease_status_progression() {
         &end_date,
         &property_uri,
     );
-    
+
     let lease = client.get_lease();
     assert_eq!(lease.status, LeaseStatus::Pending);
-    
+
     // Activate lease
     client.activate_lease(&tenant);
     let lease = client.get_lease();
     assert_eq!(lease.status, LeaseStatus::Active);
-    
+
     // Mark as disputed
     let release = DepositRelease::Disputed;
     client.release_deposit(&release);
@@ -1597,13 +1600,13 @@ fn test_iot_oracle_functionality() {
         &end_date,
         &property_uri,
     );
-    
+
     // Before lease activation, tenant should not be current
     assert!(!client.is_tenant_current_on_rent());
     assert_eq!(client.get_lease_status(), symbol_short!("pending"));
-    
+
     client.activate_lease(&tenant);
-    
+
     // After activation, tenant should be current
     assert!(client.is_tenant_current_on_rent());
     assert_eq!(client.get_lease_status(), symbol_short!("active"));
