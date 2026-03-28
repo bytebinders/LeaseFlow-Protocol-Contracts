@@ -40,6 +40,22 @@ pub enum LeaseStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UtilityBillStatus {
+    Pending,
+    Paid,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubletStatus {
+    Inactive,
+    Active,
+    Terminated,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaintenanceStatus {
     None,
     Reported,
@@ -59,6 +75,36 @@ pub enum DepositRelease {
 pub struct DepositReleasePartial {
     pub tenant_amount: i128,
     pub landlord_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UtilityBill {
+    pub lease_id: u64,
+    pub bill_hash: BytesN<32>,
+    pub usdc_amount: i128,
+    pub created_at: u64,
+    pub due_date: u64,
+    pub status: UtilityBillStatus,
+    pub paid_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubletAgreement {
+    pub lease_id: u64,
+    pub original_tenant: Address,
+    pub sub_tenant: Address,
+    pub start_date: u64,
+    pub end_date: u64,
+    pub rent_amount: i128,
+    pub landlord_percentage_bps: u32, // Basis points (e.g., 8000 = 80%)
+    pub tenant_percentage_bps: u32,    // Basis points (e.g., 2000 = 20%)
+    pub status: SubletStatus,
+    pub created_at: u64,
+    pub total_collected: i128,
+    pub landlord_share: i128,
+    pub tenant_share: i128,
 }
 
 // ── Structs ───────────────────────────────────────────────────────────────────
@@ -121,6 +167,9 @@ pub struct LeaseInstance {
     pub withdrawal_address: Option<Address>,
     pub rent_withdrawn: i128,
     pub arbitrators: soroban_sdk::Vec<Address>,
+    pub maintenance_status: MaintenanceStatus,
+    pub withheld_rent: i128,
+    pub repair_proof_hash: Option<BytesN<32>>,
     /// Emergency pause state for natural disasters or force majeure events
     pub paused: bool,
     /// Reason for the emergency pause
@@ -151,6 +200,17 @@ pub struct LeaseInstance {
     pub has_pet: bool,
     pub pet_deposit_amount: i128,
     pub pet_rent_amount: i128,
+    /// [ISSUE 36] Utility Pass-Through Billing
+    pub next_utility_bill_id: u64,
+    pub total_utility_billed: i128,
+    pub total_utility_paid: i128,
+    /// [ISSUE 37] Subletting Authorization and Fee Split
+    pub sublet_enabled: bool,
+    pub sub_tenant: Option<Address>,
+    pub sublet_start_date: Option<u64>,
+    pub sublet_end_date: Option<u64>,
+    pub sublet_landlord_percentage_bps: u32,
+    pub sublet_tenant_percentage_bps: u32,
 }
 
 #[contracttype]
@@ -216,6 +276,8 @@ pub enum DataKey {
     AllowedAsset(Address),
     AuthorizedPayer(u64, Address),
     RoommateBalance(u64, Address),
+    UtilityBill(u64, u64), // lease_id, bill_id
+    SubletAgreement(u64),  // lease_id
 }
 
 #[contracttype]
@@ -370,6 +432,52 @@ pub struct ResidencyNftMinted {
     pub tenant: Address,
 }
 
+#[contractevent]
+pub struct UtilityBillRequested {
+    pub lease_id: u64,
+    pub bill_id: u64,
+    pub bill_hash: BytesN<32>,
+    pub usdc_amount: i128,
+    pub due_date: u64,
+}
+
+#[contractevent]
+pub struct UtilityBillPaid {
+    pub lease_id: u64,
+    pub bill_id: u64,
+    pub tenant: Address,
+    pub amount: i128,
+    pub paid_at: u64,
+}
+
+#[contractevent]
+pub struct SubletAuthorized {
+    pub lease_id: u64,
+    pub original_tenant: Address,
+    pub sub_tenant: Address,
+    pub start_date: u64,
+    pub end_date: u64,
+    pub rent_amount: i128,
+    pub landlord_percentage_bps: u32,
+    pub tenant_percentage_bps: u32,
+}
+
+#[contractevent]
+pub struct SubletRentPaid {
+    pub lease_id: u64,
+    pub sub_tenant: Address,
+    pub amount: i128,
+    pub landlord_share: i128,
+    pub tenant_share: i128,
+}
+
+#[contractevent]
+pub struct SubletTerminated {
+    pub lease_id: u64,
+    pub terminated_by: Address,
+    pub terminated_at: u64,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -401,6 +509,17 @@ pub enum LeaseError {
     PetNotFound = 24,
     IneligibleForResidencyNft = 25,
     InvalidPercentage = 26,
+    UtilityBillNotFound = 27,
+    UtilityBillAlreadyPaid = 28,
+    UtilityBillExpired = 29,
+    InvalidAmount = 30,
+    SubletAlreadyEnabled = 31,
+    SubletNotEnabled = 32,
+    SubletAgreementNotFound = 33,
+    InvalidSubletDates = 34,
+    InvalidPercentageSplit = 35,
+    SubletTenantUnauthorized = 36,
+    LeaseAlreadyExists = 37,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -492,6 +611,34 @@ pub fn archive_lease(env: &Env, lease_id: u64, lease: LeaseInstance, caller: Add
         .persistent()
         .set(&DataKey::HistoricalLease(lease_id), &historical);
     delete_lease_instance(env, lease_id);
+}
+
+pub fn save_utility_bill(env: &Env, lease_id: u64, bill_id: u64, bill: &UtilityBill) {
+    let key = DataKey::UtilityBill(lease_id, bill_id);
+    env.storage().persistent().set(&key, bill);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_utility_bill(env: &Env, lease_id: u64, bill_id: u64) -> Option<UtilityBill> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UtilityBill(lease_id, bill_id))
+}
+
+pub fn save_sublet_agreement(env: &Env, lease_id: u64, agreement: &SubletAgreement) {
+    let key = DataKey::SubletAgreement(lease_id);
+    env.storage().persistent().set(&key, agreement);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_sublet_agreement(env: &Env, lease_id: u64) -> Option<SubletAgreement> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubletAgreement(lease_id))
 }
 
 mod nft_contract {
@@ -945,6 +1092,17 @@ impl LeaseContract {
             has_pet: params.has_pet,
             pet_deposit_amount: params.pet_deposit_amount,
             pet_rent_amount: params.pet_rent_amount,
+            // Utility Billing Initialization
+            next_utility_bill_id: 1,
+            total_utility_billed: 0,
+            total_utility_paid: 0,
+            // Subletting Initialization
+            sublet_enabled: false,
+            sub_tenant: None,
+            sublet_start_date: None,
+            sublet_end_date: None,
+            sublet_landlord_percentage_bps: 8000, // Default 80% to landlord
+            sublet_tenant_percentage_bps: 2000,   // Default 20% to original tenant
         };
         save_lease_instance(&env, lease_id, &lease);
         Ok(())
@@ -1557,6 +1715,329 @@ impl LeaseContract {
             .persistent()
             .get(&DataKey::RoommateBalance(lease_id, roommate))
             .unwrap_or(0)
+    }
+
+    // --- [ISSUE 36] Utility Pass-Through Billing ---
+
+    /// Landlord requests utility payment from tenant by uploading bill hash and USDC amount
+    /// Tenant has 7 days to pay the utility bill through the contract
+    pub fn request_utility_payment(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        bill_hash: BytesN<32>,
+        usdc_amount: i128,
+    ) -> Result<u64, LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        if usdc_amount <= 0 {
+            return Err(LeaseError::InvalidAmount);
+        }
+        
+        landlord.require_auth();
+        
+        let now = env.ledger().timestamp();
+        let due_date = now + (7 * 24 * 60 * 60); // 7 days from now
+        
+        let bill_id = lease.next_utility_bill_id;
+        let utility_bill = UtilityBill {
+            lease_id,
+            bill_hash: bill_hash.clone(),
+            usdc_amount,
+            created_at: now,
+            due_date,
+            status: UtilityBillStatus::Pending,
+            paid_at: None,
+        };
+        
+        // Save the utility bill
+        save_utility_bill(&env, lease_id, bill_id, &utility_bill);
+        
+        // Update lease state
+        lease.next_utility_bill_id += 1;
+        lease.total_utility_billed += usdc_amount;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Publish event
+        UtilityBillRequested {
+            lease_id,
+            bill_id,
+            bill_hash,
+            usdc_amount,
+            due_date,
+        }.publish(&env);
+        
+        Ok(bill_id)
+    }
+    
+    /// Tenant pays a utility bill
+    pub fn pay_utility_bill(
+        env: Env,
+        lease_id: u64,
+        bill_id: u64,
+        tenant: Address,
+        payment_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.tenant != tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        let mut utility_bill = load_utility_bill(&env, lease_id, bill_id)
+            .ok_or(LeaseError::UtilityBillNotFound)?;
+            
+        if utility_bill.status != UtilityBillStatus::Pending {
+            return Err(LeaseError::UtilityBillAlreadyPaid);
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Check if bill has expired (7 days past due date)
+        if now > utility_bill.due_date {
+            utility_bill.status = UtilityBillStatus::Expired;
+            save_utility_bill(&env, lease_id, bill_id, &utility_bill);
+            return Err(LeaseError::UtilityBillExpired);
+        }
+        
+        if payment_amount != utility_bill.usdc_amount {
+            return Err(LeaseError::InvalidAmount);
+        }
+        
+        tenant.require_auth();
+        
+        // Update utility bill status
+        utility_bill.status = UtilityBillStatus::Paid;
+        utility_bill.paid_at = Some(now);
+        save_utility_bill(&env, lease_id, bill_id, &utility_bill);
+        
+        // Update lease totals
+        lease.total_utility_paid += payment_amount;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Publish event
+        UtilityBillPaid {
+            lease_id,
+            bill_id,
+            tenant,
+            amount: payment_amount,
+            paid_at: now,
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Get details of a specific utility bill
+    pub fn get_utility_bill(env: Env, lease_id: u64, bill_id: u64) -> Result<UtilityBill, LeaseError> {
+        load_utility_bill(&env, lease_id, bill_id).ok_or(LeaseError::UtilityBillNotFound)
+    }
+    
+    /// Get all utility bills for a lease (returns count, actual bills would need pagination)
+    pub fn get_utility_bill_count(env: Env, lease_id: u64) -> Result<u64, LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        Ok(lease.next_utility_bill_id - 1)
+    }
+
+    // --- [ISSUE 37] Subletting Authorization and Fee Split ---
+
+    /// Original tenant authorizes a sub-tenant with specified rent and percentage split
+    pub fn authorize_sublet(
+        env: Env,
+        lease_id: u64,
+        original_tenant: Address,
+        sub_tenant: Address,
+        start_date: u64,
+        end_date: u64,
+        rent_amount: i128,
+        landlord_percentage_bps: u32,
+        tenant_percentage_bps: u32,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.tenant != original_tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        if lease.sublet_enabled {
+            return Err(LeaseError::SubletAlreadyEnabled);
+        }
+        
+        // Validate percentage split (must add up to 10000 = 100%)
+        if landlord_percentage_bps + tenant_percentage_bps != 10000 {
+            return Err(LeaseError::InvalidPercentageSplit);
+        }
+        
+        // Validate dates
+        let now = env.ledger().timestamp();
+        if start_date < now || end_date <= start_date || end_date > lease.end_date {
+            return Err(LeaseError::InvalidSubletDates);
+        }
+        
+        if rent_amount <= 0 {
+            return Err(LeaseError::InvalidAmount);
+        }
+        
+        original_tenant.require_auth();
+        
+        // Create sublet agreement
+        let sublet_agreement = SubletAgreement {
+            lease_id,
+            original_tenant: original_tenant.clone(),
+            sub_tenant: sub_tenant.clone(),
+            start_date,
+            end_date,
+            rent_amount,
+            landlord_percentage_bps,
+            tenant_percentage_bps,
+            status: SubletStatus::Active,
+            created_at: now,
+            total_collected: 0,
+            landlord_share: 0,
+            tenant_share: 0,
+        };
+        
+        // Update lease state
+        lease.sublet_enabled = true;
+        lease.sub_tenant = Some(sub_tenant.clone());
+        lease.sublet_start_date = Some(start_date);
+        lease.sublet_end_date = Some(end_date);
+        lease.sublet_landlord_percentage_bps = landlord_percentage_bps;
+        lease.sublet_tenant_percentage_bps = tenant_percentage_bps;
+        
+        // Save changes
+        save_sublet_agreement(&env, lease_id, &sublet_agreement);
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Publish event
+        SubletAuthorized {
+            lease_id,
+            original_tenant,
+            sub_tenant,
+            start_date,
+            end_date,
+            rent_amount,
+            landlord_percentage_bps,
+            tenant_percentage_bps,
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Sub-tenant pays rent, which gets split between landlord and original tenant
+    pub fn pay_sublet_rent(
+        env: Env,
+        lease_id: u64,
+        sub_tenant: Address,
+        payment_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if !lease.sublet_enabled {
+            return Err(LeaseError::SubletNotEnabled);
+        }
+        
+        if lease.sub_tenant.as_ref() != Some(&sub_tenant) {
+            return Err(LeaseError::SubletTenantUnauthorized);
+        }
+        
+        let mut sublet_agreement = load_sublet_agreement(&env, lease_id)
+            .ok_or(LeaseError::SubletAgreementNotFound)?;
+            
+        if sublet_agreement.status != SubletStatus::Active {
+            return Err(LeaseError::SubletNotEnabled);
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Check if sublet is still valid
+        if now < sublet_agreement.start_date || now > sublet_agreement.end_date {
+            return Err(LeaseError::InvalidSubletDates);
+        }
+        
+        if payment_amount != sublet_agreement.rent_amount {
+            return Err(LeaseError::InvalidAmount);
+        }
+        
+        sub_tenant.require_auth();
+        
+        // Calculate splits
+        let landlord_share = (payment_amount * (sublet_agreement.landlord_percentage_bps as i128)) / 10000;
+        let tenant_share = payment_amount - landlord_share;
+        
+        // Update sublet agreement
+        sublet_agreement.total_collected += payment_amount;
+        sublet_agreement.landlord_share += landlord_share;
+        sublet_agreement.tenant_share += tenant_share;
+        save_sublet_agreement(&env, lease_id, &sublet_agreement);
+        
+        // Update lease rent tracking (landlord portion counts as rent paid)
+        lease.rent_paid += landlord_share;
+        lease.cumulative_payments += payment_amount;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Publish event
+        SubletRentPaid {
+            lease_id,
+            sub_tenant,
+            amount: payment_amount,
+            landlord_share,
+            tenant_share,
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Terminate sublet agreement (can be called by original tenant or landlord)
+    pub fn terminate_sublet(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if !lease.sublet_enabled {
+            return Err(LeaseError::SubletNotEnabled);
+        }
+        
+        let is_original_tenant = caller == lease.tenant;
+        let is_landlord = caller == lease.landlord;
+        
+        if !is_original_tenant && !is_landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        caller.require_auth();
+        
+        let mut sublet_agreement = load_sublet_agreement(&env, lease_id)
+            .ok_or(LeaseError::SubletAgreementNotFound)?;
+            
+        sublet_agreement.status = SubletStatus::Terminated;
+        save_sublet_agreement(&env, lease_id, &sublet_agreement);
+        
+        // Reset lease subletting state
+        lease.sublet_enabled = false;
+        lease.sub_tenant = None;
+        lease.sublet_start_date = None;
+        lease.sublet_end_date = None;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Publish event
+        SubletTerminated {
+            lease_id,
+            terminated_by: caller,
+            terminated_at: env.ledger().timestamp(),
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Get sublet agreement details
+    pub fn get_sublet_agreement(env: Env, lease_id: u64) -> Result<SubletAgreement, LeaseError> {
+        load_sublet_agreement(&env, lease_id).ok_or(LeaseError::SubletAgreementNotFound)
     }
 }
 
