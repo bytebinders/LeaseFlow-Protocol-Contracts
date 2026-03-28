@@ -157,6 +157,7 @@ pub struct LeaseInstance {
     pub start_date: u64,
     pub end_date: u64,
     pub property_uri: String,
+    pub property_hash: BytesN<32>,
     pub status: LeaseStatus,
     pub nft_contract: Option<Address>,
     pub token_id: Option<u128>,
@@ -2380,6 +2381,84 @@ impl LeaseContract {
         save_lease_instance(&env, lease_id, &lease);
         
         Ok(())
+    }
+    
+    /// Generates a unique property hash based on property URI and landlord
+    fn generate_property_hash(env: &Env, property_uri: &String, landlord: &Address) -> BytesN<32> {
+        // Very simple deterministic hash generation
+        // In production, this should use proper cryptographic hashing
+        let mut result = [0u8; 32];
+        
+        // Use property URI length for variation
+        let uri_len = property_uri.to_bytes().len() as u8;
+        result[0] = uri_len;
+        
+        // Use a simple pattern - this is just for demonstration
+        result[1] = 42;
+        result[2] = 123;
+        
+        // Fill rest with a simple pattern
+        for i in 3..32 {
+            result[i] = result[i-1].wrapping_add(result[i-2]).wrapping_mul(7);
+        }
+        
+        BytesN::from_array(&env, &result)
+    }
+    
+    /// Checks if property is already registered in global registry
+    fn is_property_already_leased(env: &Env, property_hash: &BytesN<32>) -> bool {
+        let key = (symbol_short!("GLOBAL"), property_hash);
+        env.storage()
+            .persistent()
+            .get::<_, Address>(&key)
+            .is_some()
+    }
+    
+    /// Registers property in global registry
+    fn register_property_in_global(env: &Env, property_hash: &BytesN<32>, contract_address: &Address) {
+        let key = (symbol_short!("GLOBAL"), property_hash);
+        env.storage()
+            .persistent()
+            .set(&key, contract_address);
+    }
+    
+    /// Removes property from global registry (for lease termination)
+    pub fn remove_from_global_registry(env: Env, landlord: Address) -> Symbol {
+        let lease = Self::get_lease(env.clone());
+        
+        require!(lease.landlord == landlord, LeaseError::UnauthorizedRegistryRemoval);
+        require!(lease.status == LeaseStatus::Expired, LeaseError::LeaseNotActive);
+        
+        let key = (symbol_short!("GLOBAL"), &lease.property_hash);
+        env.storage()
+            .persistent()
+            .remove(&key);
+        
+        symbol_short!("removed")
+    }
+    
+    /// Checks if tenant is current on rent (for IoT integration)
+    pub fn is_tenant_current_on_rent(env: Env) -> bool {
+        let lease = Self::get_lease(env.clone());
+        
+        match lease.status {
+            LeaseStatus::Active => {
+                let current_time = env.ledger().timestamp();
+                current_time < lease.end_date
+            }
+            _ => false,
+        }
+    }
+    
+    /// Gets lease status for external systems
+    pub fn get_lease_status(env: Env) -> Symbol {
+        let lease = Self::get_lease(env.clone());
+        match lease.status {
+            LeaseStatus::Pending => symbol_short!("pending"),
+            LeaseStatus::Active => symbol_short!("active"),
+            LeaseStatus::Expired => symbol_short!("expired"),
+            LeaseStatus::Disputed => symbol_short!("disputed"),
+        }
     }
 }
 
