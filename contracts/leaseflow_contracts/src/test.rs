@@ -357,10 +357,6 @@ fn test_reclaim_fails_when_balance_not_zero() {
     assert_eq!(result, Err(Ok(LeaseError::DepositNotSettled)));
 }
 
-// ---------------------------------------------------------------------------
-// NFT Escrow Tests
-// ---------------------------------------------------------------------------
-
 #[contractclient(name = "MockNftClient")]
 pub trait MockNftInterface {
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
@@ -640,10 +636,6 @@ fn test_buyout_price_not_reached() {
     assert_eq!(lease.cumulative_payments, 1000i128);
     assert!(lease.active);
 }
-
-// ---------------------------------------------------------------------------
-// conclude_lease tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_conclude_lease_no_damages_full_refund() {
