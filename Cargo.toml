@@ -10,6 +10,10 @@ members = [
 soroban-sdk = "25"
 leaseflow_math = { path = "crates/leaseflow_math" }
 
+[workspace.metadata.audit]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
