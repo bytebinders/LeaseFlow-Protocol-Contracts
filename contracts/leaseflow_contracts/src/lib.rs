@@ -175,6 +175,10 @@ pub enum DataKey {
     AllowedAsset(Address),
     AuthorizedPayer(u64, Address),
     RoommateBalance(u64, Address),
+    PlatformFeeAmount,
+    PlatformFeeToken,
+    PlatformFeeRecipient,
+    TermsHash,
 }
 
 #[contracttype]
@@ -251,6 +255,17 @@ pub struct MaintenanceVerified {
 }
 
 #[contractevent]
+pub struct ContractUpgraded {
+    pub old_wasm_hash: BytesN<32>,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+#[contractevent]
+pub struct TermsHashUpdated {
+    pub new_terms_hash: BytesN<32>,
+}
+
+#[contractevent]
 pub struct DepositDisputed {
     pub lease_id: u64,
     pub caller: Address,
@@ -287,6 +302,7 @@ pub enum LeaseError {
     WithdrawalAddressNotSet = 13,
     NotAnArbitrator = 14,
     LeaseAlreadyExists = 15,
+    UpgradeNotAllowed = 16,
 }
 
 macro_rules! require {
@@ -1354,6 +1370,52 @@ impl LeaseContract {
             .get(&DataKey::RoommateBalance(lease_id, roommate))
             .unwrap_or(0)
     }
+
+    pub fn set_terms_hash(env: Env, admin: Address, hash: BytesN<32>) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::TermsHash, &hash);
+        TermsHashUpdated { new_terms_hash: hash }.publish(&env);
+        Ok(())
+    }
+
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+        expected_terms_hash: BytesN<32>,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+
+        if let Some(current_hash) = env
+            .storage()
+            .instance()
+            .get::<_, BytesN<32>>(&DataKey::TermsHash)
+        {
+            if current_hash != expected_terms_hash {
+                return Err(LeaseError::UpgradeNotAllowed);
+            }
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
 }
 
 mod test;
+mod upgrade_tests;

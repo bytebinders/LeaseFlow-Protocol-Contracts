@@ -12,6 +12,7 @@ These errors occur when a user attempts to perform an action without proper auth
 | 100 | UnauthorizedTenant | Only tenant can perform this action | You are not authorized as the tenant for this lease |
 | 101 | UnauthorizedLandlord | Only landlord can perform this action | You are not authorized as the landlord for this property |
 | 102 | UnauthorizedRegistryRemoval | Only landlord can remove from registry | Only the property owner can remove this listing |
+| 103 | UpgradeNotAllowed | Upgrade logic mismatch or unauthorized | Contract upgrade failed due to terms mismatch or lack of permissions |
 
 ### Lease State Errors (200-299)
 These errors occur when the lease is in an invalid state for the requested operation.
